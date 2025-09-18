@@ -3,7 +3,7 @@ import 'package:http/http.dart' as http;
 
 class MistralService {
   static const String _baseUrl = 'https://api.mistral.ai/v1';
-  static const String _apiKey = 'dKhIMMQHS5Fa8DeynrD163XIs2TUJxlP';
+  static const String _apiKey = 'HrFeGigJieGKMsPcw81lYUtEEvPI4CZn';
   
   // Mistral model to use
   static const String _model = 'mistral-tiny';

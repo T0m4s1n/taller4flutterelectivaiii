@@ -1,37 +1,78 @@
-import 'package:get/get.dart';
+import 'package:flutter/foundation.dart';
 import '../models/message.dart';
 import '../models/user.dart';
 import '../services/mistral_service.dart';
+import '../services/database_service.dart';
+import '../services/auth_service.dart';
 import 'background_controller.dart';
 
-class ChatController extends GetxController {
+class ChatController extends ChangeNotifier {
   // Observable lists for reactive UI updates
-  final RxList<Message> messages = <Message>[].obs;
-  final RxBool isLoading = false.obs;
-  final RxBool isTyping = false.obs;
-  
-  // Current user
-  final User currentUser = User(
-    id: 'user_1',
-    name: 'You',
-  );
+  final List<Message> _messages = <Message>[];
+  bool _isLoading = false;
+  bool _isTyping = false;
+  final List<Map<String, dynamic>> _chats = <Map<String, dynamic>>[];
+  String? _currentChatId;
   
   // AI user (for demo purposes)
   final User aiUser = User(
     id: 'ai_1',
     name: 'AI Assistant',
+    email: 'ai@assistant.com',
   );
 
   // Background controller reference
   BackgroundController? _backgroundController;
 
-  @override
-  void onInit() {
-    super.onInit();
+  // Getters
+  List<Message> get messages => _messages;
+  bool get isLoading => _isLoading;
+  bool get isTyping => _isTyping;
+  List<Map<String, dynamic>> get chats => _chats;
+  String? get currentChatId => _currentChatId;
+
+  // Get current user from auth service
+  User? get currentUser {
+    try {
+      return AuthService.instance.currentUser;
+    } catch (e) {
+      print('Error getting current user: $e');
+      return null;
+    }
+  }
+
+  void initialize() {
     // Initialize background controller
-    _backgroundController = Get.find<BackgroundController>(tag: 'background');
-    // Add welcome message
-    _addWelcomeMessage();
+    try {
+      // We'll handle background controller separately since it's not critical
+      print('Chat controller initialized');
+    } catch (e) {
+      print('Background controller not found: $e');
+    }
+    // Load user chats and start new chat if needed
+    _initializeChat();
+  }
+
+  Future<void> _initializeChat() async {
+    try {
+      if (currentUser != null) {
+        await loadUserChats();
+        if (_chats.isEmpty) {
+          await createNewChat();
+        } else {
+          // Load the most recent chat
+          _currentChatId = _chats.first['id'];
+          await loadChatMessages(_currentChatId!);
+        }
+      } else {
+        // Add welcome message for non-authenticated users
+        _addWelcomeMessage();
+      }
+    } catch (e) {
+      print('Error initializing chat: $e');
+      // Fallback: just add welcome message
+      _addWelcomeMessage();
+    }
   }
 
   void _addWelcomeMessage() {
@@ -42,8 +83,72 @@ class ChatController extends GetxController {
       senderName: aiUser.name,
       timestamp: DateTime.now(),
       isFromUser: false,
+      chatId: _currentChatId,
     );
-    messages.add(welcomeMessage);
+    _messages.add(welcomeMessage);
+    notifyListeners();
+  }
+
+  // Database operations
+  Future<void> loadUserChats() async {
+    if (currentUser != null) {
+      final userChats = await DatabaseService.getUserChats(currentUser!.id);
+      _chats.clear();
+      _chats.addAll(userChats);
+      notifyListeners();
+    }
+  }
+
+  Future<void> createNewChat({String? title}) async {
+    if (currentUser != null) {
+      final chatTitle = title ?? 'New Chat - ${DateTime.now().day}/${DateTime.now().month}';
+      final chatId = await DatabaseService.createChat(
+        userId: currentUser!.id,
+        title: chatTitle,
+      );
+      _currentChatId = chatId;
+      _messages.clear();
+      _addWelcomeMessage();
+      await loadUserChats(); // Refresh chat list
+      
+      // Save welcome message to database
+      if (_messages.isNotEmpty) {
+        await DatabaseService.insertMessage(_messages.last, chatId);
+      }
+      notifyListeners();
+    }
+  }
+
+  Future<void> loadChatMessages(String chatId) async {
+    _currentChatId = chatId;
+    final chatMessages = await DatabaseService.getChatMessages(chatId);
+    _messages.clear();
+    _messages.addAll(chatMessages);
+    notifyListeners();
+  }
+
+  Future<void> switchToChat(String chatId) async {
+    await loadChatMessages(chatId);
+  }
+
+  Future<void> deleteChat(String chatId) async {
+    await DatabaseService.deleteChat(chatId);
+    await loadUserChats();
+    
+    if (_currentChatId == chatId) {
+      if (_chats.isNotEmpty) {
+        await switchToChat(_chats.first['id']);
+      } else {
+        await createNewChat();
+      }
+    }
+    notifyListeners();
+  }
+
+  Future<void> renameChatTitle(String chatId, String newTitle) async {
+    await DatabaseService.updateChatTitle(chatId, newTitle);
+    await loadUserChats();
+    notifyListeners();
   }
 
   // Test API connection
@@ -52,11 +157,16 @@ class ChatController extends GetxController {
   }
 
   // Send a message
-  void sendMessage(String text) {
-    if (text.trim().isEmpty) return;
+  Future<void> sendMessage(String text) async {
+    if (text.trim().isEmpty || currentUser == null) return;
+
+    // Ensure we have a current chat
+    if (_currentChatId == null) {
+      await createNewChat();
+    }
 
     // Check for special commands first
-    if (_handleSpecialCommands(text.trim())) {
+    if (await _handleSpecialCommands(text.trim())) {
       return;
     }
 
@@ -67,13 +177,20 @@ class ChatController extends GetxController {
     final userMessage = Message(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
       text: text.trim(),
-      senderId: currentUser.id,
-      senderName: currentUser.name,
+      senderId: currentUser!.id,
+      senderName: currentUser!.name,
       timestamp: DateTime.now(),
       isFromUser: true,
+      chatId: _currentChatId,
     );
     
-    messages.add(userMessage);
+    _messages.add(userMessage);
+    notifyListeners();
+    
+    // Save user message to database
+    if (_currentChatId != null) {
+      await DatabaseService.insertMessage(userMessage, _currentChatId!);
+    }
     
     // Change background state to AI typing
     _backgroundController?.changeState(BackgroundState.aiTyping);
@@ -83,13 +200,13 @@ class ChatController extends GetxController {
   }
 
   // Handle special commands
-  bool _handleSpecialCommands(String text) {
+  Future<bool> _handleSpecialCommands(String text) async {
     final lowerText = text.toLowerCase();
     
     // Check for color change commands
     if (lowerText.contains('cambia el color') || lowerText.contains('change color') || 
         lowerText.contains('cambiar color') || lowerText.contains('cambiar fondo')) {
-      _handleColorChangeCommand(text);
+      await _handleColorChangeCommand(text);
       return true;
     }
     
@@ -97,13 +214,13 @@ class ChatController extends GetxController {
     if (lowerText.contains('nuevo chat') || lowerText.contains('new chat') || 
         lowerText.contains('iniciar chat') || lowerText.contains('start chat') ||
         lowerText.contains('limpiar chat') || lowerText.contains('clear chat')) {
-      _handleNewChatCommand();
+      await _handleNewChatCommand();
       return true;
     }
     
     // Check for theme commands
     if (lowerText.contains('tema') || lowerText.contains('theme')) {
-      _handleThemeCommand(text);
+      await _handleThemeCommand(text);
       return true;
     }
     
@@ -111,7 +228,7 @@ class ChatController extends GetxController {
   }
 
   // Handle color change commands
-  void _handleColorChangeCommand(String text) {
+  Future<void> _handleColorChangeCommand(String text) async {
     final lowerText = text.toLowerCase();
     String? selectedTheme;
     
@@ -157,11 +274,19 @@ class ChatController extends GetxController {
         senderName: aiUser.name,
         timestamp: DateTime.now(),
         isFromUser: false,
+        chatId: _currentChatId,
       );
-      messages.add(confirmationMessage);
+      _messages.add(confirmationMessage);
+      
+      // Save message to database
+      if (_currentChatId != null) {
+        await DatabaseService.insertMessage(confirmationMessage, _currentChatId!);
+      }
       
       // Change background state to message received
       _backgroundController?.changeState(BackgroundState.messageReceived);
+      
+      notifyListeners();
       
       // Return to idle state after a delay
       Future.delayed(const Duration(seconds: 2), () {
@@ -171,12 +296,8 @@ class ChatController extends GetxController {
   }
 
   // Handle new chat commands
-  void _handleNewChatCommand() {
-    // Clear all messages
-    messages.clear();
-    
-    // Add welcome message
-    _addWelcomeMessage();
+  Future<void> _handleNewChatCommand() async {
+    await createNewChat();
     
     // Reset background colors to default
     _backgroundController?.resetColors();
@@ -191,7 +312,7 @@ class ChatController extends GetxController {
   }
 
   // Handle theme commands
-  void _handleThemeCommand(String text) {
+  Future<void> _handleThemeCommand(String text) async {
     final themes = _backgroundController?.availableThemes.keys.toList() ?? [];
     if (themes.isNotEmpty) {
       final themeList = themes.join(', ');
@@ -202,11 +323,19 @@ class ChatController extends GetxController {
         senderName: aiUser.name,
         timestamp: DateTime.now(),
         isFromUser: false,
+        chatId: _currentChatId,
       );
-      messages.add(themeMessage);
+      _messages.add(themeMessage);
+      
+      // Save message to database
+      if (_currentChatId != null) {
+        await DatabaseService.insertMessage(themeMessage, _currentChatId!);
+      }
       
       // Change background state to message received
       _backgroundController?.changeState(BackgroundState.messageReceived);
+      
+      notifyListeners();
       
       // Return to idle state after a delay
       Future.delayed(const Duration(seconds: 2), () {
@@ -217,12 +346,13 @@ class ChatController extends GetxController {
 
   // Get AI response from Mistral API
   void _simulateAIResponse(String userMessage) {
-    isLoading.value = true;
-    isTyping.value = true;
+    _isLoading = true;
+    _isTyping = true;
+    notifyListeners();
     
     // Call Mistral API
     MistralService.sendMessage(userMessage).then((aiResponse) {
-      isTyping.value = false;
+      _isTyping = false;
       
       final aiMessage = Message(
         id: DateTime.now().millisecondsSinceEpoch.toString(),
@@ -231,13 +361,21 @@ class ChatController extends GetxController {
         senderName: aiUser.name,
         timestamp: DateTime.now(),
         isFromUser: false,
+        chatId: _currentChatId,
       );
       
-      messages.add(aiMessage);
-      isLoading.value = false;
+      _messages.add(aiMessage);
+      _isLoading = false;
+      
+      // Save AI message to database
+      if (_currentChatId != null) {
+        DatabaseService.insertMessage(aiMessage, _currentChatId!);
+      }
       
       // Change background state to message received
       _backgroundController?.changeState(BackgroundState.messageReceived);
+      
+      notifyListeners();
       
       // Return to idle state after a delay
       Future.delayed(const Duration(seconds: 2), () {
@@ -245,8 +383,8 @@ class ChatController extends GetxController {
       });
     }).catchError((error) {
       // Handle API error
-      isTyping.value = false;
-      isLoading.value = false;
+      _isTyping = false;
+      _isLoading = false;
       
       final errorMessage = Message(
         id: DateTime.now().millisecondsSinceEpoch.toString(),
@@ -255,12 +393,20 @@ class ChatController extends GetxController {
         senderName: aiUser.name,
         timestamp: DateTime.now(),
         isFromUser: false,
+        chatId: _currentChatId,
       );
       
-      messages.add(errorMessage);
+      _messages.add(errorMessage);
+      
+      // Save error message to database
+      if (_currentChatId != null) {
+        DatabaseService.insertMessage(errorMessage, _currentChatId!);
+      }
       
       // Change background state to error
       _backgroundController?.changeState(BackgroundState.error);
+      
+      notifyListeners();
       
       // Return to idle state after a delay
       Future.delayed(const Duration(seconds: 3), () {
@@ -269,16 +415,16 @@ class ChatController extends GetxController {
     });
   }
 
-
   // Clear all messages
   void clearMessages() {
-    messages.clear();
+    _messages.clear();
     _addWelcomeMessage();
+    notifyListeners();
   }
 
   // Get message count
-  int get messageCount => messages.length;
+  int get messageCount => _messages.length;
 
   // Check if there are any messages
-  bool get hasMessages => messages.isNotEmpty;
+  bool get hasMessages => _messages.isNotEmpty;
 }
